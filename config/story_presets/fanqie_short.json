@@ -1,0 +1,39 @@
+{
+  "name": "fanqie_short_story",
+  "book_type": "short_story",
+  "target_words": 20000,
+  "best_word_range": [10000, 30000],
+  "allowed_word_range": [6000, 80000],
+  "segment_words": 2000,
+  "narration": "first_person",
+  "opening_100_words": [
+    "冲突",
+    "背叛",
+    "危机",
+    "打脸",
+    "离婚",
+    "压迫",
+    "捉奸",
+    "破产",
+    "重生",
+    "系统"
+  ],
+  "opening_300_words": [
+    "巨大钩子",
+    "身份反差",
+    "第一次反转",
+    "核心悬念"
+  ],
+  "beat_interval_words": 1000,
+  "required_beat_types": [
+    "打脸",
+    "爽点",
+    "反转",
+    "危机升级",
+    "暧昧升级",
+    "身份曝光",
+    "情绪爆发",
+    "极端偏爱",
+    "翻盘"
+  ]
+}

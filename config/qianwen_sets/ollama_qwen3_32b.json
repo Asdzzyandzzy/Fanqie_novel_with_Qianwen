@@ -1,0 +1,11 @@
+{
+  "name": "ollama_qwen3_32b",
+  "provider": "openai_compatible",
+  "base_url": "http://127.0.0.1:11434/v1/chat/completions",
+  "api_key": "ollama",
+  "model": "hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M",
+  "temperature": 0.82,
+  "top_p": 0.92,
+  "max_tokens": 4096,
+  "timeout_seconds": 1800
+}
