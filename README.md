@@ -6,7 +6,7 @@ The project does not try to replace a human writer. Its goal is to make the writ
 
 ## What It Does
 
-The pipeline has three layers:
+The pipeline has four layers:
 
 - **Story planning**: builds a structured outline with title, premise, character roles, emotional arc, reversals, and beat planning.
 - **Prompt orchestration**: converts the plan into execution prompts designed for a local Qwen model.
@@ -38,7 +38,7 @@ This makes the project closer to a small writing systems tool than a single prom
 
 ```text
 config/
-  qianwen_sets/              # Local model endpoint and decoding settings
+  qianwen_sets/              # Legacy JSON model profiles
   story_presets/             # Story type presets and target structure
 
 knowledge/
@@ -50,10 +50,11 @@ prompts/
 
 src/fanqie_pipeline/
   memory.py                  # Persistent story-state model across segments
+  model/                     # Unified model client, config, and providers
   outline.py                 # Outline validation for longer targets
   planner.py                 # Builds the outline and segment prompts
   quality.py                 # Lightweight generated-text checks
-  qianwen_client.py          # Calls local Qwen through an OpenAI-compatible API
+  qianwen_client.py          # Backward-compatible wrapper around model/
   run.py                     # Command-line entry point
   state.py                   # Pause/resume generation state
 ```
@@ -69,21 +70,88 @@ That folder is intentionally ignored by Git.
 ## Requirements
 
 - Python 3.10+
-- A local OpenAI-compatible LLM endpoint
-- Ollama is supported by default
+- A local or remote OpenAI-compatible chat completions endpoint
+- Ollama is supported by default for local inference
 
-The default model profile points to:
+## Model Configuration
+
+The application uses one model interface regardless of where the model runs:
+
+```python
+response = model_client.generate(
+    messages=messages,
+    temperature=temperature,
+    max_tokens=max_tokens,
+)
+```
+
+Novel generation code does not branch on local vs remote models. Provider switching is handled by `src/fanqie_pipeline/model/`.
+
+Copy `.env.example` to `.env`:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+`.env` is ignored by Git so API keys do not get committed.
+
+### Local Model
+
+Use this when running Ollama or another local OpenAI-compatible server:
+
+```env
+MODEL_PROVIDER=local
+LOCAL_MODEL_BASE_URL=http://127.0.0.1:11434/v1
+LOCAL_MODEL_NAME=hf.co/Qwen/Qwen3-14B-GGUF:Q4_K_M
+LOCAL_API_KEY=ollama
+```
+
+Defaults if `.env` is missing:
 
 ```text
-http://127.0.0.1:11434/v1/chat/completions
+MODEL_PROVIDER=local
+LOCAL_MODEL_BASE_URL=http://127.0.0.1:11434/v1
 hf.co/Qwen/Qwen3-14B-GGUF:Q4_K_M
+MODEL_TEMPERATURE=0.82
+MODEL_TOP_P=0.92
+MODEL_MAX_TOKENS=4096
+MODEL_TIMEOUT_SECONDS=1200
 ```
 
-A 32B profile is also included:
+### Remote API Model
 
-```text
-config/qianwen_sets/ollama_qwen3_32b.json
+Use this for OpenAI or another OpenAI-compatible remote API:
+
+```env
+MODEL_PROVIDER=api
+API_MODEL_BASE_URL=https://api.openai.com/v1
+API_MODEL_NAME=gpt-4o-mini
+API_KEY=your_api_key_here
 ```
+
+If `MODEL_PROVIDER=api` and `API_KEY` is missing, the program exits with a readable configuration error.
+
+### Environment Variables
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `MODEL_PROVIDER` | `local` or `api` | `local` |
+| `LOCAL_MODEL_BASE_URL` | Local OpenAI-compatible base URL | `http://127.0.0.1:11434/v1` |
+| `LOCAL_MODEL_NAME` | Local model name | `hf.co/Qwen/Qwen3-14B-GGUF:Q4_K_M` |
+| `LOCAL_API_KEY` | Optional local API key placeholder | `ollama` |
+| `API_MODEL_BASE_URL` | Remote API base URL | `https://api.openai.com/v1` |
+| `API_MODEL_NAME` | Remote model name | `gpt-4o-mini` |
+| `API_KEY` | Remote API key | required for `api` |
+| `MODEL_TEMPERATURE` | Sampling temperature | `0.82` |
+| `MODEL_TOP_P` | Top-p sampling | `0.92` |
+| `MODEL_MAX_TOKENS` | Max output tokens per request | `4096` |
+| `MODEL_TIMEOUT_SECONDS` | Request timeout | `1200` |
+| `MODEL_REPEAT_PENALTY` | Repeat penalty if provider supports it | `1.08` |
+| `MODEL_PRESENCE_PENALTY` | Optional presence penalty | omitted |
+| `MODEL_FREQUENCY_PENALTY` | Optional frequency penalty | omitted |
+| `MODEL_SEED` | Optional deterministic seed | omitted |
+
+Legacy JSON profiles under `config/qianwen_sets/` still work through `--qianwen-set`, but `.env` is the preferred configuration path.
 
 ## Usage
 
@@ -163,6 +231,8 @@ python -m src.fanqie_pipeline.run `
   --mode generate `
   --qianwen-set config/qianwen_sets/ollama_qwen3_32b.json
 ```
+
+Prefer `.env` for new model settings. Use `--qianwen-set` only when you specifically want one of the legacy JSON profiles.
 
 Unload the Ollama model after generation to free GPU memory:
 

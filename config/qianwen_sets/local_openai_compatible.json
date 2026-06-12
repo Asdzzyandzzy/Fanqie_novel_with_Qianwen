@@ -1,7 +1,7 @@
 {
   "name": "ollama_qwen3_14b",
-  "provider": "openai_compatible",
-  "base_url": "http://127.0.0.1:11434/v1/chat/completions",
+  "provider": "local",
+  "base_url": "http://127.0.0.1:11434/v1",
   "api_key": "ollama",
   "model": "hf.co/Qwen/Qwen3-14B-GGUF:Q4_K_M",
   "temperature": 0.82,

@@ -28,8 +28,8 @@ if __package__ in (None, ""):
     from src.fanqie_pipeline.memory import StoryMemory
     from src.fanqie_pipeline.outline import inspect_outline, write_outline_report
     from src.fanqie_pipeline.quality import append_quality_report, inspect_segment
-    from src.fanqie_pipeline.qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
     from src.fanqie_pipeline.state import GenerationState
+    from src.fanqie_pipeline.model import ModelClient
 else:
     from .planner import (
         build_chapter_prompt,
@@ -43,8 +43,8 @@ else:
     from .memory import StoryMemory
     from .outline import inspect_outline, write_outline_report
     from .quality import append_quality_report, inspect_segment
-    from .qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
     from .state import GenerationState
+    from .model import ModelClient
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,9 +81,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--qianwen-set",
-        default=str(ROOT / "config" / "qianwen_sets" / "local_openai_compatible.json"),
-        help="千问参数配置文件",
+        default=None,
+        help="旧版 JSON 模型配置文件；不传则使用 .env / 环境变量",
     )
+    parser.add_argument("--env-file", default=str(ROOT / ".env"), help=".env 配置文件路径")
     args = parser.parse_args()
 
     plan = build_plan(
@@ -98,18 +99,18 @@ def main() -> None:
 
     if args.mode == "generate":
         try:
-            qianwen_set = load_qianwen_set(Path(args.qianwen_set))
+            model_client = _build_model_client(args)
             if args.timeout_seconds is not None:
-                qianwen_set["timeout_seconds"] = args.timeout_seconds
-            _log(f"已连接配置：{qianwen_set.get('name', 'unknown')} / {qianwen_set.get('model', 'unknown')}")
-            _log(f"单次请求最长等待：{qianwen_set.get('timeout_seconds', 180)} 秒")
+                model_client.config.timeout_seconds = args.timeout_seconds
+            _log(f"已连接模型：{model_client.config.display_name}")
+            _log(f"单次请求最长等待：{model_client.config.timeout_seconds} 秒")
             if args.style == "chapters":
-                output_paths, final_path = _generate_units(args, paths, plan, qianwen_set, unit_kind="chapter")
+                output_paths, final_path = _generate_units(args, paths, plan, model_client, unit_kind="chapter")
             else:
-                output_paths, final_path = _generate_units(args, paths, plan, qianwen_set, unit_kind="segment")
+                output_paths, final_path = _generate_units(args, paths, plan, model_client, unit_kind="segment")
             if args.unload_after:
                 _log("正在卸载本地模型以释放显存...")
-                unload_qianwen_model(qianwen_set)
+                model_client.unload()
                 _log("模型卸载请求已发送。")
         except KeyboardInterrupt:
             _mark_generation_state(paths["book_dir"], "paused", "用户中断。")
@@ -134,7 +135,7 @@ def main() -> None:
                         "message": str(exc),
                         "outline": str(paths["outline"]),
                         "prompt": str(paths["prompt"]),
-                        "fix": "启动本地千问 OpenAI 兼容服务，或修改 --qianwen-set 指向正确的配置文件。",
+                        "fix": "检查 .env / 环境变量，或启动本地 OpenAI-compatible 模型服务。",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -173,6 +174,13 @@ def _resolve_chapters(chapters: str, chapter_count: int) -> list[int]:
     return [chapter_number]
 
 
+def _build_model_client(args: argparse.Namespace) -> ModelClient:
+    env_path = Path(args.env_file) if args.env_file else None
+    if args.qianwen_set:
+        return ModelClient.from_config_file(Path(args.qianwen_set), env_path=env_path)
+    return ModelClient.from_env(env_path=env_path)
+
+
 def _mark_generation_state(book_dir: Path, status: str, message: str) -> None:
     state_path = book_dir / "generation_state.json"
     if not state_path.exists():
@@ -198,7 +206,7 @@ def _resolve_total_units(args: argparse.Namespace) -> int:
     return max(1, math.ceil(args.target_words / max(args.segment_words, 1)))
 
 
-def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict, unit_kind: str) -> tuple[list[Path], Path]:
+def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, model_client: ModelClient, unit_kind: str) -> tuple[list[Path], Path]:
     total_units = _resolve_total_units(args)
     output_paths = []
     state_path = paths["book_dir"] / "generation_state.json"
@@ -258,11 +266,11 @@ def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, qian
             memory_context=memory_context,
             unit_label=unit_name,
         )
-        segment_text = call_qianwen(prompt, qianwen_set)
+        segment_text = model_client.generate(messages=_messages(prompt))
         segment_text = _repair_short_segment(
             args=args,
             plan=plan,
-            qianwen_set=qianwen_set,
+            model_client=model_client,
             segment_text=segment_text,
             segment_number=unit_number,
             segment_count=total_units,
@@ -277,7 +285,7 @@ def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, qian
         segment_text, quality_report = _revise_failed_segment(
             args=args,
             plan=plan,
-            qianwen_set=qianwen_set,
+            model_client=model_client,
             segment_text=segment_text,
             quality_report=quality_report,
             segment_number=unit_number,
@@ -315,7 +323,7 @@ def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, qian
     return all_outputs, final_path
 
 
-def _generate_chapters(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict) -> tuple[list[Path], Path]:
+def _generate_chapters(args: argparse.Namespace, paths: dict[str, Path], plan, model_client: ModelClient) -> tuple[list[Path], Path]:
     chapter_numbers = _resolve_chapters(args.chapters, args.chapter_count)
     chapter_paths = []
     total = len(chapter_numbers)
@@ -324,7 +332,7 @@ def _generate_chapters(args: argparse.Namespace, paths: dict[str, Path], plan, q
         started_at = time.time()
         _log(f"[{index}/{total}] 第{chapter_number}章开始生成...")
         chapter_prompt = build_chapter_prompt(plan, chapter_number, args.chapter_count)
-        chapter_text = call_qianwen(chapter_prompt, qianwen_set)
+        chapter_text = model_client.generate(messages=_messages(chapter_prompt))
         chapter_path = paths["drafts"] / f"chapter_{chapter_number:03d}.md"
         chapter_path.write_text(chapter_text, encoding="utf-8")
         chapter_paths.append(chapter_path)
@@ -337,7 +345,7 @@ def _generate_chapters(args: argparse.Namespace, paths: dict[str, Path], plan, q
     return chapter_paths, final_path
 
 
-def _repair_short_segment(args: argparse.Namespace, plan, qianwen_set: dict, segment_text: str, segment_number: int, segment_count: int) -> str:
+def _repair_short_segment(args: argparse.Namespace, plan, model_client: ModelClient, segment_text: str, segment_number: int, segment_count: int) -> str:
     for round_number in range(1, args.max_repair_rounds + 1):
         if len(segment_text) >= args.min_segment_chars:
             return segment_text
@@ -350,7 +358,7 @@ def _repair_short_segment(args: argparse.Namespace, plan, qianwen_set: dict, seg
             missing_words=max(500, missing),
             current_segment_tail=segment_text[-args.context_chars :],
         )
-        addition = call_qianwen(repair_prompt, qianwen_set)
+        addition = model_client.generate(messages=_messages(repair_prompt))
         segment_text = segment_text.rstrip() + "\n\n" + addition.strip()
     return segment_text
 
@@ -358,7 +366,7 @@ def _repair_short_segment(args: argparse.Namespace, plan, qianwen_set: dict, seg
 def _revise_failed_segment(
     args: argparse.Namespace,
     plan,
-    qianwen_set: dict,
+    model_client: ModelClient,
     segment_text: str,
     quality_report,
     segment_number: int,
@@ -384,11 +392,11 @@ def _revise_failed_segment(
             issues=issues,
             unit_label=unit_label,
         )
-        segment_text = call_qianwen(revision_prompt, qianwen_set)
+        segment_text = model_client.generate(messages=_messages(revision_prompt))
         segment_text = _repair_short_segment(
             args=args,
             plan=plan,
-            qianwen_set=qianwen_set,
+            model_client=model_client,
             segment_text=segment_text,
             segment_number=segment_number,
             segment_count=segment_count,
@@ -400,6 +408,20 @@ def _revise_failed_segment(
             previous_tail=previous_tail,
         )
     return segment_text, quality_report
+
+
+def _messages(prompt: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "/no_think\n"
+                "你是番茄短故事执行作者。"
+                "必须保持第一人称、强连续性、高冲突、高反转、高情绪密度，只输出正文。"
+            ),
+        },
+        {"role": "user", "content": "/no_think\n" + prompt},
+    ]
 
 
 def _merge_chapters(drafts_dir: Path, final_path: Path) -> None:
