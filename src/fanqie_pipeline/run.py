@@ -21,31 +21,37 @@ if __package__ in (None, ""):
         build_plan,
         build_segment_continuation_prompt,
         build_segment_prompt,
+        build_segment_revision_prompt,
         get_segment_beats,
         save_book_files,
     )
     from src.fanqie_pipeline.memory import StoryMemory
+    from src.fanqie_pipeline.outline import inspect_outline, write_outline_report
     from src.fanqie_pipeline.quality import append_quality_report, inspect_segment
     from src.fanqie_pipeline.qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
+    from src.fanqie_pipeline.state import GenerationState
 else:
     from .planner import (
         build_chapter_prompt,
         build_plan,
         build_segment_continuation_prompt,
         build_segment_prompt,
+        build_segment_revision_prompt,
         get_segment_beats,
         save_book_files,
     )
     from .memory import StoryMemory
+    from .outline import inspect_outline, write_outline_report
     from .quality import append_quality_report, inspect_segment
     from .qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
+    from .state import GenerationState
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="番茄爆款短篇小说总控系统")
+    parser = argparse.ArgumentParser(description="本地 Qwen 长短篇小说生成管线")
     parser.add_argument("--topic", required=True, help="题材或核心梗，例如：妻子为了白月光逼我离婚")
     parser.add_argument("--book-id", required=True, help="书籍目录名，只用英文、数字、短横线更稳")
     parser.add_argument("--mode", choices=["outline", "prompt", "generate"], default="prompt")
@@ -56,14 +62,18 @@ def main() -> None:
         "--style",
         choices=["continuous", "chapters"],
         default="continuous",
-        help="continuous=番茄短故事一篇完结不分章；chapters=旧版按章生成",
+        help="continuous=短故事连续分段；chapters=长篇按章生成并保留断点",
     )
     parser.add_argument("--segment-words", type=int, default=2000, help="连续短故事每段目标字数")
     parser.add_argument("--context-chars", type=int, default=2600, help="回喂上一段结尾多少字")
     parser.add_argument("--min-segment-chars", type=int, default=1600, help="低于这个长度会自动续写补足")
     parser.add_argument("--max-repair-rounds", type=int, default=2, help="单段太短时最多补写几次")
+    parser.add_argument("--max-revision-rounds", type=int, default=1, help="质量检查失败时最多重写几次")
     parser.add_argument("--timeout-seconds", type=int, default=None, help="单次请求千问最长等待秒数；本地慢卡可设 1200 或 1800")
     parser.add_argument("--unload-after", action="store_true", help="生成完成后卸载 Ollama 模型，释放显存")
+    parser.add_argument("--resume", action="store_true", help="从 generation_state.json 和 story_state.json 断点继续")
+    parser.add_argument("--stop-file", default="pause.flag", help="生成中如果书籍目录出现该文件，则当前单元完成后暂停")
+    parser.add_argument("--max-units-per-run", type=int, default=None, help="本次最多生成多少个单元，便于分批跑百万字")
     parser.add_argument(
         "--chapters",
         default="all",
@@ -82,6 +92,9 @@ def main() -> None:
         chapter_count=args.chapter_count,
     )
     paths = save_book_files(ROOT, args.book_type, args.book_id, plan)
+    total_units = _resolve_total_units(args)
+    outline_report = inspect_outline(plan, args.target_words, total_units)
+    write_outline_report(paths["book_dir"] / "outline_report.md", outline_report)
 
     if args.mode == "generate":
         try:
@@ -91,14 +104,29 @@ def main() -> None:
             _log(f"已连接配置：{qianwen_set.get('name', 'unknown')} / {qianwen_set.get('model', 'unknown')}")
             _log(f"单次请求最长等待：{qianwen_set.get('timeout_seconds', 180)} 秒")
             if args.style == "chapters":
-                output_paths, final_path = _generate_chapters(args, paths, plan, qianwen_set)
+                output_paths, final_path = _generate_units(args, paths, plan, qianwen_set, unit_kind="chapter")
             else:
-                output_paths, final_path = _generate_continuous(args, paths, plan, qianwen_set)
+                output_paths, final_path = _generate_units(args, paths, plan, qianwen_set, unit_kind="segment")
             if args.unload_after:
                 _log("正在卸载本地模型以释放显存...")
                 unload_qianwen_model(qianwen_set)
                 _log("模型卸载请求已发送。")
+        except KeyboardInterrupt:
+            _mark_generation_state(paths["book_dir"], "paused", "用户中断。")
+            print(
+                json.dumps(
+                    {
+                        "status": "paused",
+                        "message": "检测到中断，已保存断点。下次使用 --resume 继续。",
+                        "state": str(paths["book_dir"] / "generation_state.json"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            sys.exit(130)
         except Exception as exc:
+            _mark_generation_state(paths["book_dir"], "error", str(exc))
             print(
                 json.dumps(
                     {
@@ -114,10 +142,13 @@ def main() -> None:
             )
             sys.exit(1)
         result = {
-            "status": "generated",
+            "status": _read_generation_status(paths["book_dir"]) or "generated",
             "style": args.style,
             "outline": str(paths["outline"]),
             "prompt": str(paths["prompt"]),
+            "generation_state": str(paths["book_dir"] / "generation_state.json"),
+            "story_state": str(paths["book_dir"] / "story_state.json"),
+            "quality_report": str(paths["book_dir"] / "quality_report.md"),
             "outputs": [str(path) for path in output_paths],
             "final": str(final_path),
         }
@@ -126,6 +157,7 @@ def main() -> None:
             "status": "planned",
             "outline": str(paths["outline"]),
             "prompt": str(paths["prompt"]),
+            "outline_report": str(paths["book_dir"] / "outline_report.md"),
             "next": "确认本地千问服务已启动后，把 --mode 改成 generate 生成正文。",
         }
 
@@ -141,31 +173,90 @@ def _resolve_chapters(chapters: str, chapter_count: int) -> list[int]:
     return [chapter_number]
 
 
-def _generate_continuous(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict) -> tuple[list[Path], Path]:
-    segment_count = max(1, math.ceil(args.target_words / max(args.segment_words, 1)))
+def _mark_generation_state(book_dir: Path, status: str, message: str) -> None:
+    state_path = book_dir / "generation_state.json"
+    if not state_path.exists():
+        return
+    state = GenerationState.load(state_path)
+    if status == "paused":
+        state.mark_paused()
+    else:
+        state.mark_error(message)
+    state.save(state_path)
+
+
+def _read_generation_status(book_dir: Path) -> str | None:
+    state_path = book_dir / "generation_state.json"
+    if not state_path.exists():
+        return None
+    return GenerationState.load(state_path).status
+
+
+def _resolve_total_units(args: argparse.Namespace) -> int:
+    if args.style == "chapters" and args.chapter_count > 0:
+        return max(args.chapter_count, math.ceil(args.target_words / max(args.segment_words, 1)))
+    return max(1, math.ceil(args.target_words / max(args.segment_words, 1)))
+
+
+def _generate_units(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict, unit_kind: str) -> tuple[list[Path], Path]:
+    total_units = _resolve_total_units(args)
     output_paths = []
-    memory = StoryMemory.from_plan(plan)
-    _log(f"准备生成连续短文：目标 {args.target_words} 字，约 {segment_count} 段，每段约 {args.segment_words} 字")
+    state_path = paths["book_dir"] / "generation_state.json"
+    memory_path = paths["book_dir"] / "story_state.json"
+    stop_path = paths["book_dir"] / args.stop_file
+    memory = StoryMemory.load(memory_path) if args.resume and memory_path.exists() else StoryMemory.from_plan(plan)
+    state = (
+        GenerationState.load(state_path)
+        if args.resume and state_path.exists()
+        else GenerationState.create(
+            book_id=args.book_id,
+            book_type=args.book_type,
+            style=args.style,
+            target_words=args.target_words,
+            unit_words=args.segment_words,
+            total_units=total_units,
+        )
+    )
+    state.status = "running"
+    state.save(state_path)
+    memory.save(memory_path)
+
+    unit_name = "章" if unit_kind == "chapter" else "段"
+    _log(f"准备生成：目标 {args.target_words} 字，约 {total_units} {unit_name}，每{unit_name}约 {args.segment_words} 字")
+    _log(f"当前断点：从第 {state.next_unit} {unit_name}开始，已生成约 {state.current_chars} 字")
     _log(f"输出目录：{paths['drafts']}")
     log_path = paths["book_dir"] / "generation_log.md"
-    state_path = paths["book_dir"] / "story_state.json"
     quality_path = paths["book_dir"] / "quality_report.md"
-    log_path.write_text(
-        f"# 生成日志\n\n目标字数：{args.target_words}\n\n分段字数：{args.segment_words}\n\n回喂字数：{args.context_chars}\n\n",
-        encoding="utf-8",
-    )
-    quality_path.write_text("# Quality Report\n\n", encoding="utf-8")
+    if not args.resume or not log_path.exists():
+        log_path.write_text(
+            f"# 生成日志\n\n目标字数：{args.target_words}\n\n单元字数：{args.segment_words}\n\n回喂字数：{args.context_chars}\n\n",
+            encoding="utf-8",
+        )
+    if not args.resume or not quality_path.exists():
+        quality_path.write_text("# Quality Report\n\n", encoding="utf-8")
 
-    for segment_number in range(1, segment_count + 1):
+    generated_this_run = 0
+    for unit_number in range(state.next_unit, total_units + 1):
+        if args.max_units_per_run is not None and generated_this_run >= args.max_units_per_run:
+            state.mark_paused()
+            state.save(state_path)
+            _log(f"达到本次生成上限 --max-units-per-run={args.max_units_per_run}，已暂停。")
+            break
+        if stop_path.exists():
+            state.mark_paused()
+            state.save(state_path)
+            _log(f"检测到暂停文件：{stop_path}。当前不会启动新{unit_name}，状态已保存。")
+            break
         started_at = time.time()
-        _log(f"[{segment_number}/{segment_count}] 第{segment_number}段开始生成...")
+        _log(f"[{unit_number}/{total_units}] 第{unit_number}{unit_name}开始生成...")
         memory_context = memory.build_prompt_block(args.context_chars)
         prompt = build_segment_prompt(
             plan=plan,
-            segment_number=segment_number,
-            segment_count=segment_count,
+            segment_number=unit_number,
+            segment_count=total_units,
             segment_words=args.segment_words,
             memory_context=memory_context,
+            unit_label=unit_name,
         )
         segment_text = call_qianwen(prompt, qianwen_set)
         segment_text = _repair_short_segment(
@@ -173,34 +264,55 @@ def _generate_continuous(args: argparse.Namespace, paths: dict[str, Path], plan,
             plan=plan,
             qianwen_set=qianwen_set,
             segment_text=segment_text,
-            segment_number=segment_number,
-            segment_count=segment_count,
+            segment_number=unit_number,
+            segment_count=total_units,
         )
-        segment_path = paths["drafts"] / f"segment_{segment_number:03d}.md"
-        segment_path.write_text(segment_text, encoding="utf-8")
-        output_paths.append(segment_path)
-        local_beats = get_segment_beats(plan, segment_number, segment_count)
+        local_beats = get_segment_beats(plan, unit_number, total_units)
         quality_report = inspect_segment(
             text=segment_text,
-            segment_number=segment_number,
+            segment_number=unit_number,
             min_chars=args.min_segment_chars,
             previous_tail=memory.recent_tail,
         )
+        segment_text, quality_report = _revise_failed_segment(
+            args=args,
+            plan=plan,
+            qianwen_set=qianwen_set,
+            segment_text=segment_text,
+            quality_report=quality_report,
+            segment_number=unit_number,
+            segment_count=total_units,
+            memory_context=memory_context,
+            unit_label=unit_name,
+            previous_tail=memory.recent_tail,
+        )
+        prefix = "chapter" if unit_kind == "chapter" else "segment"
+        segment_path = paths["drafts"] / f"{prefix}_{unit_number:04d}.md"
+        segment_path.write_text(segment_text, encoding="utf-8")
+        output_paths.append(segment_path)
         append_quality_report(quality_path, quality_report)
-        _append_generation_log(log_path, segment_number, segment_count, memory_context, segment_text, args.context_chars)
-        memory.record_segment(segment_number, segment_text, local_beats, args.context_chars)
-        memory.save(state_path)
+        _append_generation_log(log_path, unit_number, total_units, memory_context, segment_text, args.context_chars)
+        memory.record_segment(unit_number, segment_text, local_beats, args.context_chars)
+        memory.save(memory_path)
+        state.record_unit(unit_number, segment_path, len(segment_text), quality_report.passed)
+        state.save(state_path)
+        generated_this_run += 1
         elapsed = time.time() - started_at
         qa_status = "通过" if quality_report.passed else "有问题"
-        _log(f"[{segment_number}/{segment_count}] 第{segment_number}段完成，用时 {elapsed:.1f}s，约 {len(segment_text)} 字，QA：{qa_status}：{segment_path}")
+        _log(f"[{unit_number}/{total_units}] 第{unit_number}{unit_name}完成，用时 {elapsed:.1f}s，约 {len(segment_text)} 字，QA：{qa_status}：{segment_path}")
+        if state.is_complete:
+            _log(f"目标完成：当前累计约 {state.current_chars} 字，状态 {state.status}。")
+            break
 
     final_path = paths["final"] / "novel.md"
-    _merge_outputs(output_paths, final_path)
-    _log(f"已合并连续成稿：{final_path}")
+    all_outputs = _collect_outputs(paths["drafts"], unit_kind)
+    _merge_outputs(all_outputs, final_path)
+    _log(f"已合并成稿：{final_path}")
     _log(f"生成日志：{log_path}")
-    _log(f"故事状态：{state_path}")
+    _log(f"生成状态：{state_path}")
+    _log(f"故事记忆：{memory_path}")
     _log(f"质量报告：{quality_path}")
-    return output_paths, final_path
+    return all_outputs, final_path
 
 
 def _generate_chapters(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict) -> tuple[list[Path], Path]:
@@ -243,6 +355,53 @@ def _repair_short_segment(args: argparse.Namespace, plan, qianwen_set: dict, seg
     return segment_text
 
 
+def _revise_failed_segment(
+    args: argparse.Namespace,
+    plan,
+    qianwen_set: dict,
+    segment_text: str,
+    quality_report,
+    segment_number: int,
+    segment_count: int,
+    memory_context: str,
+    unit_label: str,
+    previous_tail: str,
+) -> tuple[str, object]:
+    for round_number in range(1, args.max_revision_rounds + 1):
+        if quality_report.passed:
+            return segment_text, quality_report
+        issues = [issue.message for issue in quality_report.issues if issue.level == "error"]
+        if not issues:
+            return segment_text, quality_report
+        _log(f"[{segment_number}/{segment_count}] QA失败，开始第 {round_number} 轮重写：{'; '.join(issues)}")
+        revision_prompt = build_segment_revision_prompt(
+            plan=plan,
+            segment_number=segment_number,
+            segment_count=segment_count,
+            segment_words=args.segment_words,
+            memory_context=memory_context,
+            rejected_text=segment_text,
+            issues=issues,
+            unit_label=unit_label,
+        )
+        segment_text = call_qianwen(revision_prompt, qianwen_set)
+        segment_text = _repair_short_segment(
+            args=args,
+            plan=plan,
+            qianwen_set=qianwen_set,
+            segment_text=segment_text,
+            segment_number=segment_number,
+            segment_count=segment_count,
+        )
+        quality_report = inspect_segment(
+            text=segment_text,
+            segment_number=segment_number,
+            min_chars=args.min_segment_chars,
+            previous_tail=previous_tail,
+        )
+    return segment_text, quality_report
+
+
 def _merge_chapters(drafts_dir: Path, final_path: Path) -> None:
     chapter_files = sorted(drafts_dir.glob("chapter_*.md"))
     _merge_outputs(chapter_files, final_path)
@@ -253,6 +412,11 @@ def _merge_outputs(output_paths: list[Path], final_path: Path) -> None:
     for path in output_paths:
         content.append(path.read_text(encoding="utf-8").strip())
     final_path.write_text("\n\n".join(content) + "\n", encoding="utf-8")
+
+
+def _collect_outputs(drafts_dir: Path, unit_kind: str) -> list[Path]:
+    prefix = "chapter" if unit_kind == "chapter" else "segment"
+    return sorted(drafts_dir.glob(f"{prefix}_*.md"))
 
 
 def _append_generation_log(

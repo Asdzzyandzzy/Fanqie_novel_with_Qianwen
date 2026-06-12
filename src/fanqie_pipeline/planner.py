@@ -34,7 +34,9 @@ def build_plan(topic: str, target_words: int = 12000, chapter_count: int = 6) ->
     topic = topic.strip() or "离婚当天，我继承千亿集团"
     title = _build_title(topic)
     chapter_words = max(1200, target_words // max(chapter_count, 1))
-    beat_count = max(8, target_words // 500)
+    # 长篇不能把几千个节奏点全部塞进 Prompt；保留可读上限，
+    # 运行时会按单元动态补齐阶段目标。
+    beat_count = min(80, max(8, target_words // 1000))
 
     first_three = [
         f"第1章：100字内切入背叛或离婚危机；300字内抛出主角隐藏身份线索。反派当众羞辱，女主误信白月光，主角签字离开，结尾让顶级人物跪迎主角。",
@@ -209,6 +211,7 @@ def build_segment_prompt(
     segment_count: int,
     segment_words: int,
     memory_context: str,
+    unit_label: str = "段",
 ) -> str:
     """为信息流短文生成连续分段 Prompt。
 
@@ -221,7 +224,7 @@ def build_segment_prompt(
     memory_block = memory_context.strip() or "无。这是正文开头，必须100字内爆冲突。"
     return f"""/no_think
 
-你是番茄小说短故事执行作者。现在写一篇连续完结短故事的第{segment_number}/{segment_count}段，不要写章节标题。
+你是番茄小说执行作者。现在写第{segment_number}/{segment_count}{unit_label}。
 
 书名：{plan.title}
 题材：{plan.topic}
@@ -234,9 +237,9 @@ def build_segment_prompt(
 1. 第一段开头100字内必须爆冲突。
 2. 如果不是第一段，第一句话必须紧接上一段最后的动作、对白或悬念，不许换场硬跳。
 3. 不许改名，不许改人物关系，不许把已经发生的事写反。
-4. 本段必须继续推进，不许总结前文，不许重讲上一段。
+4. 本{unit_label}必须继续推进，不许总结前文，不许重讲上一段。
 5. 每800-1200字至少一个爆点：打脸、反转、危机升级、身份曝光、情绪爆发、极端偏爱、翻盘。
-6. 段尾必须留钩，但不要写“未完待续”。
+6. {unit_label}尾必须留钩，但不要写“未完待续”。
 7. 优先使用第一人称“我”，不要突然切成上帝视角。
 
 本段必须吃掉的爆点：
@@ -252,7 +255,7 @@ def build_segment_prompt(
 短句。高频对话。高频冲突。高频推进。番茄短故事风。网文语言。第一人称强代入。
 禁止文学腔、慢热、长环境描写、大段心理活动、无意义对白、解释世界观。
 
-只输出正文，不要标题、不要大纲、不要分析。"""
+只输出正文，不要大纲、不要分析。"""
 
 
 def build_segment_continuation_prompt(
@@ -283,6 +286,48 @@ def build_segment_continuation_prompt(
 4. 段尾继续留钩。
 
 只输出续写正文。"""
+
+
+def build_segment_revision_prompt(
+    plan: StoryPlan,
+    segment_number: int,
+    segment_count: int,
+    segment_words: int,
+    memory_context: str,
+    rejected_text: str,
+    issues: List[str],
+    unit_label: str = "段",
+) -> str:
+    """当生成内容质量失败时，要求模型重写当前单元。"""
+
+    issue_text = "\n".join(f"- {item}" for item in issues)
+    return f"""/no_think
+
+你刚才写的第{segment_number}/{segment_count}{unit_label}没有通过质量检查，必须整{unit_label}重写。
+
+书名：{plan.title}
+题材：{plan.topic}
+本{unit_label}目标字数：至少{segment_words}字。
+
+质量问题：
+{issue_text}
+
+故事记忆：
+{memory_context}
+
+刚才失败的文本如下，只能参考其中有效剧情，不许照抄偷懒句：
+<<<
+{rejected_text[:3000]}
+>>>
+
+重写硬规则：
+1. 只输出正文，不要解释，不要大纲，不要创作思路。
+2. 不许出现“由于篇幅限制”“未完待续”“以下是”等说明性文字。
+3. 必须承接故事记忆，不许改名，不许写反既定事实。
+4. 至少{segment_words}字，不能几百字收尾。
+5. 高频冲突、高频对话、强情绪推进，{unit_label}尾留钩。
+
+现在重写第{segment_number}{unit_label}正文。"""
 
 
 def save_book_files(root: Path, book_type: str, book_id: str, plan: StoryPlan) -> Dict[str, Path]:
@@ -399,12 +444,31 @@ def _segment_phase(segment_number: int, segment_count: int) -> str:
 
 def _segment_beats(beats: List[str], segment_number: int, segment_count: int) -> List[str]:
     if not beats:
-        return []
+        return [_dynamic_segment_beat(segment_number, segment_count)]
     per_segment = max(1, len(beats) // max(segment_count, 1))
     start = (segment_number - 1) * per_segment
     if segment_number == segment_count:
-        return beats[start:]
-    return beats[start : start + per_segment]
+        selected = beats[start:]
+    else:
+        selected = beats[start : start + per_segment]
+    return selected or [_dynamic_segment_beat(segment_number, segment_count)]
+
+
+def _dynamic_segment_beat(segment_number: int, segment_count: int) -> str:
+    ratio = segment_number / max(segment_count, 1)
+    if ratio < 0.08:
+        phase = "开局强钩：用背叛、压迫、身份反差把读者拉住。"
+    elif ratio < 0.25:
+        phase = "前期扩压：反派连续得势，主角小规模反击并埋更大身份线。"
+    elif ratio < 0.5:
+        phase = "中期拓局：旧案、商业线、情感误会并行推进，避免只重复打脸。"
+    elif ratio < 0.75:
+        phase = "后期收网：证据链升级，关键盟友/敌人换位，主角权力逐步明牌。"
+    elif ratio < 0.95:
+        phase = "终局冲刺：幕后黑手反扑，主角付出代价后完成总翻盘。"
+    else:
+        phase = "收束余波：清算反派、处理女主后悔、兑现主角成长和最终选择。"
+    return f"第{segment_number}/{segment_count}单元：{phase}"
 
 
 def get_segment_beats(plan: StoryPlan, segment_number: int, segment_count: int) -> List[str]:

@@ -38,6 +38,10 @@ def inspect_segment(
     if any(marker in stripped[:120] for marker in ["第1章", "第一章", "章节", "大纲", "分析"]):
         report.issues.append(QualityIssue("warning", "开头疑似包含章节标题或说明文字。"))
 
+    lazy_markers = ["由于篇幅限制", "以下是", "故事大纲", "创作思路", "待续", "未完待续", "这一章主要", "本章主要"]
+    if any(marker in stripped for marker in lazy_markers):
+        report.issues.append(QualityIssue("error", "检测到偷懒/说明性输出，不是纯正文。"))
+
     if first_person_required and "我" not in stripped[:500]:
         report.issues.append(QualityIssue("warning", "前500字缺少第一人称“我”，代入感可能不足。"))
 
@@ -51,6 +55,14 @@ def inspect_segment(
 
     if stripped.count("。") + stripped.count("！") + stripped.count("？") < 8:
         report.issues.append(QualityIssue("warning", "句子数量偏少，可能没有充分展开。"))
+
+    dialogue_count = stripped.count("“") + stripped.count('"')
+    if dialogue_count < 4:
+        report.issues.append(QualityIssue("warning", "对白偏少，信息流推进可能不够快。"))
+
+    paragraphs = [item.strip() for item in stripped.splitlines() if item.strip()]
+    if len(paragraphs) >= 4 and len(set(paragraphs)) <= len(paragraphs) // 2:
+        report.issues.append(QualityIssue("error", "段落重复率过高。"))
 
     return report
 

@@ -29,6 +29,8 @@ The pipeline therefore includes:
 - generation logs for debugging context handoff
 - a persistent `story_state.json` file for continuity debugging
 - a `quality_report.md` file that flags short output, weak first-person usage, weak openings, and likely transition issues
+- a persistent `generation_state.json` file for pause/resume and crash recovery
+- optional chapter-style generation for long-form projects
 
 This makes the project closer to a small writing systems tool than a single prompt.
 
@@ -48,10 +50,12 @@ prompts/
 
 src/fanqie_pipeline/
   memory.py                  # Persistent story-state model across segments
+  outline.py                 # Outline validation for longer targets
   planner.py                 # Builds the outline and segment prompts
   quality.py                 # Lightweight generated-text checks
   qianwen_client.py          # Calls local Qwen through an OpenAI-compatible API
   run.py                     # Command-line entry point
+  state.py                   # Pause/resume generation state
 ```
 
 Local generated books are written to:
@@ -104,6 +108,42 @@ python -m src.fanqie_pipeline.run `
   --segment-words 2000
 ```
 
+Generate a long-form draft in chapter mode:
+
+```powershell
+python -m src.fanqie_pipeline.run `
+  --topic "被赶出家门后，我成了首富" `
+  --book-id "long-novel-demo" `
+  --mode generate `
+  --style chapters `
+  --book-type long `
+  --target-words 1000000 `
+  --segment-words 2500 `
+  --max-units-per-run 5
+```
+
+For a million-word run, use `--max-units-per-run` and generate in batches. This avoids losing a long session to a local model or GPU failure.
+
+Resume after stopping, crashing, or reaching the batch limit:
+
+```powershell
+python -m src.fanqie_pipeline.run `
+  --topic "被赶出家门后，我成了首富" `
+  --book-id "long-novel-demo" `
+  --mode generate `
+  --style chapters `
+  --book-type long `
+  --target-words 1000000 `
+  --segment-words 2500 `
+  --resume
+```
+
+Pause cleanly after the current chapter finishes by creating this file inside the book folder:
+
+```text
+books/long/long-novel-demo/pause.flag
+```
+
 For slower local GPUs, increase the request timeout:
 
 ```powershell
@@ -143,6 +183,8 @@ outline.md              # Structured plan
 qianwen_prompt.md        # Final execution prompt
 generation_log.md        # Context handoff and segment previews
 story_state.json         # Persistent story memory
+generation_state.json    # Resume checkpoint and progress state
+outline_report.md        # Outline warnings for long targets
 quality_report.md        # Segment-level QA notes
 drafts/segment_001.md    # Generated text segment
 final/novel.md           # Merged story draft
