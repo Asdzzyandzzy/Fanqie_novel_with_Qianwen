@@ -6,6 +6,7 @@
   "model": "hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M",
   "temperature": 0.82,
   "top_p": 0.92,
+  "repeat_penalty": 1.08,
   "max_tokens": 4096,
   "timeout_seconds": 1800
 }

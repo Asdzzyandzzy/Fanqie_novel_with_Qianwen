@@ -31,6 +31,9 @@ def call_qianwen(prompt: str, qianwen_set: Dict[str, Any]) -> str:
         "top_p": qianwen_set.get("top_p", 0.92),
         "max_tokens": qianwen_set.get("max_tokens", 4096),
     }
+    for key in ["repeat_penalty", "presence_penalty", "frequency_penalty", "seed"]:
+        if key in qianwen_set:
+            payload[key] = qianwen_set[key]
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         qianwen_set["base_url"],
@@ -64,14 +67,41 @@ def call_qianwen(prompt: str, qianwen_set: Dict[str, Any]) -> str:
     raise RuntimeError("模型返回为空，请检查模型服务和 max_tokens 设置。")
 
 
+def unload_qianwen_model(qianwen_set: Dict[str, Any]) -> None:
+    """让 Ollama 卸载当前模型，释放显存。
+
+    只对 Ollama 的 OpenAI 兼容地址做自动转换；其他服务暂不处理。
+    """
+
+    base_url = qianwen_set.get("base_url", "")
+    if "11434" not in base_url:
+        return
+    unload_url = "http://127.0.0.1:11434/api/generate"
+    payload = {
+        "model": qianwen_set["model"],
+        "prompt": "",
+        "keep_alive": 0,
+        "stream": False,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        unload_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        response.read()
+
+
 def _messages(prompt: str) -> List[Dict[str, str]]:
     return [
         {
             "role": "system",
             "content": (
                 "/no_think\n"
-                "你是番茄短篇、红果短剧风执行作者。"
-                "必须短句、高冲突、高反转、高情绪密度，只输出正文。"
+                "你是番茄短故事执行作者。"
+                "必须保持第一人称、强连续性、高冲突、高反转、高情绪密度，只输出正文。"
             ),
         },
         {"role": "user", "content": "/no_think\n" + prompt},

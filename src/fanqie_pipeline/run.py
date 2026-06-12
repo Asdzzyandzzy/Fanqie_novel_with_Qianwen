@@ -7,6 +7,11 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 if __package__ in (None, ""):
     # 兼容直接运行：python src/fanqie_pipeline/run.py
     # 正常推荐：python -m src.fanqie_pipeline.run
@@ -16,18 +21,24 @@ if __package__ in (None, ""):
         build_plan,
         build_segment_continuation_prompt,
         build_segment_prompt,
+        get_segment_beats,
         save_book_files,
     )
-    from src.fanqie_pipeline.qianwen_client import call_qianwen, load_qianwen_set
+    from src.fanqie_pipeline.memory import StoryMemory
+    from src.fanqie_pipeline.quality import append_quality_report, inspect_segment
+    from src.fanqie_pipeline.qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
 else:
     from .planner import (
         build_chapter_prompt,
         build_plan,
         build_segment_continuation_prompt,
         build_segment_prompt,
+        get_segment_beats,
         save_book_files,
     )
-    from .qianwen_client import call_qianwen, load_qianwen_set
+    from .memory import StoryMemory
+    from .quality import append_quality_report, inspect_segment
+    from .qianwen_client import call_qianwen, load_qianwen_set, unload_qianwen_model
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +63,7 @@ def main() -> None:
     parser.add_argument("--min-segment-chars", type=int, default=1600, help="低于这个长度会自动续写补足")
     parser.add_argument("--max-repair-rounds", type=int, default=2, help="单段太短时最多补写几次")
     parser.add_argument("--timeout-seconds", type=int, default=None, help="单次请求千问最长等待秒数；本地慢卡可设 1200 或 1800")
+    parser.add_argument("--unload-after", action="store_true", help="生成完成后卸载 Ollama 模型，释放显存")
     parser.add_argument(
         "--chapters",
         default="all",
@@ -82,6 +94,10 @@ def main() -> None:
                 output_paths, final_path = _generate_chapters(args, paths, plan, qianwen_set)
             else:
                 output_paths, final_path = _generate_continuous(args, paths, plan, qianwen_set)
+            if args.unload_after:
+                _log("正在卸载本地模型以释放显存...")
+                unload_qianwen_model(qianwen_set)
+                _log("模型卸载请求已发送。")
         except Exception as exc:
             print(
                 json.dumps(
@@ -128,24 +144,28 @@ def _resolve_chapters(chapters: str, chapter_count: int) -> list[int]:
 def _generate_continuous(args: argparse.Namespace, paths: dict[str, Path], plan, qianwen_set: dict) -> tuple[list[Path], Path]:
     segment_count = max(1, math.ceil(args.target_words / max(args.segment_words, 1)))
     output_paths = []
-    previous_tail = ""
+    memory = StoryMemory.from_plan(plan)
     _log(f"准备生成连续短文：目标 {args.target_words} 字，约 {segment_count} 段，每段约 {args.segment_words} 字")
     _log(f"输出目录：{paths['drafts']}")
     log_path = paths["book_dir"] / "generation_log.md"
+    state_path = paths["book_dir"] / "story_state.json"
+    quality_path = paths["book_dir"] / "quality_report.md"
     log_path.write_text(
         f"# 生成日志\n\n目标字数：{args.target_words}\n\n分段字数：{args.segment_words}\n\n回喂字数：{args.context_chars}\n\n",
         encoding="utf-8",
     )
+    quality_path.write_text("# Quality Report\n\n", encoding="utf-8")
 
     for segment_number in range(1, segment_count + 1):
         started_at = time.time()
         _log(f"[{segment_number}/{segment_count}] 第{segment_number}段开始生成...")
+        memory_context = memory.build_prompt_block(args.context_chars)
         prompt = build_segment_prompt(
             plan=plan,
             segment_number=segment_number,
             segment_count=segment_count,
             segment_words=args.segment_words,
-            previous_tail=previous_tail,
+            memory_context=memory_context,
         )
         segment_text = call_qianwen(prompt, qianwen_set)
         segment_text = _repair_short_segment(
@@ -159,15 +179,27 @@ def _generate_continuous(args: argparse.Namespace, paths: dict[str, Path], plan,
         segment_path = paths["drafts"] / f"segment_{segment_number:03d}.md"
         segment_path.write_text(segment_text, encoding="utf-8")
         output_paths.append(segment_path)
-        _append_generation_log(log_path, segment_number, segment_count, previous_tail, segment_text, args.context_chars)
-        previous_tail = segment_text[-args.context_chars :]
+        local_beats = get_segment_beats(plan, segment_number, segment_count)
+        quality_report = inspect_segment(
+            text=segment_text,
+            segment_number=segment_number,
+            min_chars=args.min_segment_chars,
+            previous_tail=memory.recent_tail,
+        )
+        append_quality_report(quality_path, quality_report)
+        _append_generation_log(log_path, segment_number, segment_count, memory_context, segment_text, args.context_chars)
+        memory.record_segment(segment_number, segment_text, local_beats, args.context_chars)
+        memory.save(state_path)
         elapsed = time.time() - started_at
-        _log(f"[{segment_number}/{segment_count}] 第{segment_number}段完成，用时 {elapsed:.1f}s，约 {len(segment_text)} 字：{segment_path}")
+        qa_status = "通过" if quality_report.passed else "有问题"
+        _log(f"[{segment_number}/{segment_count}] 第{segment_number}段完成，用时 {elapsed:.1f}s，约 {len(segment_text)} 字，QA：{qa_status}：{segment_path}")
 
     final_path = paths["final"] / "novel.md"
     _merge_outputs(output_paths, final_path)
     _log(f"已合并连续成稿：{final_path}")
     _log(f"生成日志：{log_path}")
+    _log(f"故事状态：{state_path}")
+    _log(f"质量报告：{quality_path}")
     return output_paths, final_path
 
 
@@ -227,16 +259,16 @@ def _append_generation_log(
     log_path: Path,
     segment_number: int,
     segment_count: int,
-    previous_tail: str,
+    memory_context: str,
     segment_text: str,
     context_chars: int,
 ) -> None:
     preview = segment_text[:500].replace("\n", "\n> ")
     tail = segment_text[-context_chars:].replace("\n", "\n> ")
-    previous = previous_tail[-context_chars:].replace("\n", "\n> ") if previous_tail else "无"
+    memory = memory_context[-5000:].replace("\n", "\n> ") if memory_context else "无"
     with log_path.open("a", encoding="utf-8") as file:
         file.write(f"## 第{segment_number}/{segment_count}段\n\n")
-        file.write(f"### 回喂上文\n\n> {previous}\n\n")
+        file.write(f"### 回喂记忆\n\n> {memory}\n\n")
         file.write(f"### 本段开头预览\n\n> {preview}\n\n")
         file.write(f"### 本段留给下一段的尾巴\n\n> {tail}\n\n")
 

@@ -208,7 +208,7 @@ def build_segment_prompt(
     segment_number: int,
     segment_count: int,
     segment_words: int,
-    previous_tail: str,
+    memory_context: str,
 ) -> str:
     """为信息流短文生成连续分段 Prompt。
 
@@ -218,7 +218,7 @@ def build_segment_prompt(
 
     phase = _segment_phase(segment_number, segment_count)
     local_beats = _segment_beats(plan.beat_500_words, segment_number, segment_count)
-    previous_block = previous_tail.strip() or "无。这是正文开头，必须100字内爆冲突。"
+    memory_block = memory_context.strip() or "无。这是正文开头，必须100字内爆冲突。"
     return f"""/no_think
 
 你是番茄小说短故事执行作者。现在写一篇连续完结短故事的第{segment_number}/{segment_count}段，不要写章节标题。
@@ -228,10 +228,7 @@ def build_segment_prompt(
 本段目标字数：至少{segment_words}字，尽量写满，不要几百字就收。
 本段剧情位置：{phase}
 
-上一段结尾原文：
-<<<
-{previous_block}
->>>
+{memory_block}
 
 承接规则：
 1. 第一段开头100字内必须爆冲突。
@@ -408,6 +405,12 @@ def _segment_beats(beats: List[str], segment_number: int, segment_count: int) ->
     if segment_number == segment_count:
         return beats[start:]
     return beats[start : start + per_segment]
+
+
+def get_segment_beats(plan: StoryPlan, segment_number: int, segment_count: int) -> List[str]:
+    """供运行层记录当前段消费了哪些节奏点。"""
+
+    return _segment_beats(plan.beat_500_words, segment_number, segment_count)
 
 
 def _metadata_json(topic: str, title: str, book_type: str) -> str:

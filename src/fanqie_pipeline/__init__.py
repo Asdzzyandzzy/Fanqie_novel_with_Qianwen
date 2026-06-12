@@ -1,4 +1,3 @@
 """番茄爆款短篇小说总控系统。"""
 
-__all__ = ["planner", "qianwen_client", "run"]
-
+__all__ = ["memory", "planner", "qianwen_client", "quality", "run"]

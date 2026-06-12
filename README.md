@@ -11,6 +11,7 @@ The pipeline has three layers:
 - **Story planning**: builds a structured outline with title, premise, character roles, emotional arc, reversals, and beat planning.
 - **Prompt orchestration**: converts the plan into execution prompts designed for a local Qwen model.
 - **Continuous generation**: generates a full short story by target word count instead of traditional chapters, while feeding the previous segment back into the next request to improve continuity.
+- **Memory and QA loop**: stores confirmed facts, unresolved hooks, recent summaries, segment tails, and lightweight quality checks after every generated segment.
 
 The current default target is a Chinese short story in the 10,000-30,000 word range. Generated drafts are stored locally under `books/`, but they are ignored by Git so the repository stays focused on the system itself.
 
@@ -26,6 +27,8 @@ The pipeline therefore includes:
 - previous-context feedback between segments
 - automatic continuation when a segment is too short
 - generation logs for debugging context handoff
+- a persistent `story_state.json` file for continuity debugging
+- a `quality_report.md` file that flags short output, weak first-person usage, weak openings, and likely transition issues
 
 This makes the project closer to a small writing systems tool than a single prompt.
 
@@ -44,7 +47,9 @@ prompts/
   qianwen/                   # Draft-generation prompt templates
 
 src/fanqie_pipeline/
+  memory.py                  # Persistent story-state model across segments
   planner.py                 # Builds the outline and segment prompts
+  quality.py                 # Lightweight generated-text checks
   qianwen_client.py          # Calls local Qwen through an OpenAI-compatible API
   run.py                     # Command-line entry point
 ```
@@ -119,6 +124,16 @@ python -m src.fanqie_pipeline.run `
   --qianwen-set config/qianwen_sets/ollama_qwen3_32b.json
 ```
 
+Unload the Ollama model after generation to free GPU memory:
+
+```powershell
+python -m src.fanqie_pipeline.run `
+  --topic "妻子为了白月光逼我离婚，离婚当天我继承千亿集团" `
+  --book-id "lihun-qianyi" `
+  --mode generate `
+  --unload-after
+```
+
 ## Output Files
 
 Each generated book folder contains:
@@ -127,6 +142,8 @@ Each generated book folder contains:
 outline.md              # Structured plan
 qianwen_prompt.md        # Final execution prompt
 generation_log.md        # Context handoff and segment previews
+story_state.json         # Persistent story memory
+quality_report.md        # Segment-level QA notes
 drafts/segment_001.md    # Generated text segment
 final/novel.md           # Merged story draft
 metadata.json            # Topic and configuration metadata
@@ -136,10 +153,10 @@ metadata.json            # Topic and configuration metadata
 
 This is an early local-generation pipeline, not a polished writing product. The generated story quality still depends heavily on the model, prompt design, and decoding settings. The next improvements I would prioritize are:
 
-- stronger long-context memory beyond previous-tail feedback
+- stronger long-context memory beyond heuristic fact tracking
 - automated consistency checks for names, relationships, and timeline events
 - a review pass that flags weak transitions or repeated emotional beats
-- optional model unloading after generation to free GPU memory
+- optional revision passes that rewrite weak segments instead of only flagging them
 
 ## Notes
 
